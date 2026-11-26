@@ -153,9 +153,10 @@ object VideoPrefs {
     }
 
     fun power(ctx: Context): PowerMode {
-        // Default stays BALANCED until AUTO has more on-bike soak; riders can opt into Auto in Setup.
-        val name = BikeScope.getString(prefs(ctx), ctx, KEY_POWER, PowerMode.BALANCED.name)
-        return runCatching { PowerMode.valueOf(name!!) }.getOrDefault(PowerMode.BALANCED)
+        // [perf] Default SMOOTH (30 fps) instead of BALANCED (24 fps) in this build: fluidity first.
+        // Only affects bikes with no saved choice — an explicit pick in Setup still wins.
+        val name = BikeScope.getString(prefs(ctx), ctx, KEY_POWER, PowerMode.SMOOTH.name)
+        return runCatching { PowerMode.valueOf(name!!) }.getOrDefault(PowerMode.SMOOTH)
     }
 
     fun setPower(ctx: Context, mode: PowerMode) {

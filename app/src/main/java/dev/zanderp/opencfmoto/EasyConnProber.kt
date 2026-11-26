@@ -41,6 +41,9 @@ class EasyConnProber(
         const val PORT_MEDIA_CTRL = 10921   // MediaProjectService ctrl
         const val PORT_PXC_CTRL   = 10922   // PXCService ctrl (channel selects + CLIENT_INFO)
         const val BIKE_PROBE_PORT = 10930   // bike's EasyConn mDNS/probe endpoint
+        /** [perf] Timeouts for the one-shot fast-path probes in [discoverAndProbe]. */
+        private const val FAST_CONNECT_MS = 1200
+        private const val FAST_READ_MS = 2500
         const val SPOOFED_PACKAGE = "com.cfmoto.cfmotointernational"
         private val LISTEN_PORTS = intArrayOf(PORT_PXC_CTRL, PORT_MEDIA_CTRL, PORT_MEDIA_DATA)
         /** How many times to auto re-probe after a link drop before giving up (user taps Connect). */
@@ -381,6 +384,23 @@ class EasyConnProber(
     private fun discoverAndProbe(bikeIp: Inet4Address, myIp: Inet4Address, network: Network?) {
         BikeWifi.rebindProcessToBike(context)
 
+        // [perf] Fast path: before NSD (which can sit for up to 12 s on a dash that never advertises,
+        // or takes seconds to resolve on a fresh SoftAP), try the endpoint that accepted us last
+        // time, then the classic wake port — one quick attempt each with short timeouts. A closed
+        // port is refused instantly, so on dashes that need NSD this costs a few ms; on the common
+        // CFMoto :10930 path it skips the whole discovery wait.
+        val remembered = ProbeMemory.get(context)
+        if (remembered != null) {
+            log("[PROBE] fast path: last good endpoint ${remembered.first.hostAddress}:${remembered.second}")
+            probeTarget(remembered.first, remembered.second, myIp, network, attempts = 1, fast = true)
+            if (probed || !running) return
+        }
+        if (remembered == null || remembered.first != bikeIp || remembered.second != BIKE_PROBE_PORT) {
+            log("[PROBE] fast path: classic wake port ${bikeIp.hostAddress}:$BIKE_PROBE_PORT")
+            probeTarget(bikeIp, BIKE_PROBE_PORT, myIp, network, attempts = 1, fast = true)
+            if (probed || !running) return
+        }
+
         val nsd = EasyConnDiscovery.discoverNsd(context, log)
         if (!running) return
         if (nsd != null) {
@@ -488,7 +508,12 @@ class EasyConnProber(
         myIp: Inet4Address,
         network: Network?,
         attempts: Int,
+        fast: Boolean = false,
     ) {
+        // [perf] Fast-path probes use short timeouts: a live EasyConn endpoint answers in well under
+        // a second, and anything slower falls through to the normal (patient) discovery below.
+        val connectMs = if (fast) FAST_CONNECT_MS else 3000
+        val readMs = if (fast) FAST_READ_MS else 5000
         var attempt = 0
         while (running && attempt < attempts && !probed) {
             attempt++
@@ -498,8 +523,8 @@ class EasyConnProber(
                 // CRITICAL: do NOT Socket.bind(local) before Network.bindSocket — Android requires
                 // the socket unbound. Prefer the network's SocketFactory (bypasses VPN).
                 val sock = openOnBikeNetwork(network, myIp)
-                sock.connect(InetSocketAddress(host, port), 3000)
-                sock.soTimeout = 5000
+                sock.connect(InetSocketAddress(host, port), connectMs)
+                sock.soTimeout = readMs
 
                 val json = JSONProbe()
                 log("[PROBE] -> MDNS_RESPOND (0x70000010) $json")
@@ -515,6 +540,7 @@ class EasyConnProber(
                     if (resp.cmd == PxcFrame.CMD_MDNS_RESPOND_ACK && body.contains("true")) {
                         log("[PROBE] *** accepted — bike should now connect back to our ports ***")
                         probed = true
+                        ProbeMemory.put(context, host, port)
                     } else {
                         log("[PROBE] !! not accepted: $body")
                     }
@@ -532,6 +558,8 @@ class EasyConnProber(
             } catch (e: Exception) {
                 log("[PROBE] failed: ${e.javaClass.simpleName}: ${e.message}")
             }
+            // [perf] No back-off after the final attempt — the caller moves on immediately.
+            if (attempt >= attempts) break
             try { Thread.sleep(750L * attempt) } catch (_: InterruptedException) { return }
         }
     }
@@ -631,7 +659,10 @@ class EasyConnProber(
                 while (running && liveConns.get() == 0 && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
                     reconnectAttempts++
                     // Faster early retries (1s, 1.5s, 2s…) then cap — don't burn the budget on long waits.
-                    val backoff = minOf(500L + 500L * reconnectAttempts, 4_000L)
+                    // [perf] First re-probe after 300 ms instead of 1 s: a dash that dropped on a UI
+                    // transition is usually ready again almost at once.
+                    val backoff = if (reconnectAttempts == 1) 300L
+                    else minOf(500L + 500L * reconnectAttempts, 4_000L)
                     log("[reconnect] link lost — re-probing (attempt $reconnectAttempts/$MAX_RECONNECT_ATTEMPTS) in ${backoff}ms")
                     try { Thread.sleep(backoff) } catch (_: InterruptedException) { return@thread }
                     if (!running || liveConns.get() > 0) return@thread
@@ -642,7 +673,15 @@ class EasyConnProber(
                     try { yunmo?.stop() } catch (_: Exception) {}
                     yunmo = null
                     // Fast path for reconnect — classic wake → NSD → Yunmo SoftAP :8200.
-                    probeTarget(bi, BIKE_PROBE_PORT, mi, network, attempts = 2)
+                    // [perf] Try the endpoint that accepted us last (e.g. an NSD port) before the
+                    // classic one, so NSD-only dashes don't pay the classic attempts + NSD wait.
+                    val last = ProbeMemory.get(context)
+                    if (last != null && (last.first != bi || last.second != BIKE_PROBE_PORT)) {
+                        probeTarget(last.first, last.second, mi, network, attempts = 1, fast = true)
+                    }
+                    if (!probed && running && liveConns.get() == 0) {
+                        probeTarget(bi, BIKE_PROBE_PORT, mi, network, attempts = 2)
+                    }
                     if (!probed && running && liveConns.get() == 0) {
                         val ep = EasyConnDiscovery.discoverNsd(context, log)
                         if (ep != null) probeTarget(ep.host, ep.port, mi, network, attempts = 2)

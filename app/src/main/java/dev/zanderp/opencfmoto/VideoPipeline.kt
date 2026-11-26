@@ -96,7 +96,12 @@ class VideoPipeline(
     // uses to back the bitrate off. See [droppedFramesTotal] and [AdaptiveVideoController].
     @Volatile private var droppedFrames = 0L
 
-    private val frameQueue = LinkedBlockingDeque<ByteArray>(8)
+    // [perf] Was 8 (≈330 ms of stale video at 24 fps when the bike pulls a little slower than we
+    // encode — felt on every touch/zoom). 3 bounds staleness to ~1–2 frames while still absorbing
+    // pull jitter (docs/06-OPTIMIZATION-IDEAS.md, idea 3).
+    private val frameQueue = LinkedBlockingDeque<ByteArray>(FRAME_QUEUE_CAPACITY)
+    // [perf] Last time a dropped frame triggered an IDR request (rate-limited, see drainLoop).
+    @Volatile private var lastDropIdrMs = 0L
     @Volatile private var codecConfig: ByteArray? = null   // SPS/PPS
     // When set, the drain loop discards encoder output until the next keyframe, so the first frame a
     // freshly-attached bike client receives is a full SPS+PPS+IDR. See onBikeDataStart().
@@ -576,6 +581,20 @@ class VideoPipeline(
                             frameQueue.pollFirst()
                             frameQueue.offerLast(out)
                             droppedFrames++
+                            // [perf] Dropping a P-frame breaks the reference chain on the dash until
+                            // the next IDR (up to the 1–2 s GOP → smeared/blocky map). Ask for a fresh
+                            // keyframe right away, rate-limited so sustained congestion can't turn
+                            // into an IDR storm.
+                            val nowMs = android.os.SystemClock.elapsedRealtime()
+                            if (!isKey && nowMs - lastDropIdrMs >= DROP_IDR_MIN_GAP_MS) {
+                                lastDropIdrMs = nowMs
+                                try {
+                                    codec.setParameters(android.os.Bundle().apply {
+                                        putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                                    })
+                                } catch (_: Exception) {
+                                }
+                            }
                         }
                     }
                 }
@@ -790,6 +809,10 @@ class VideoPipeline(
          * docs/06-OPTIMIZATION-IDEAS.md.
          */
         const val IDLE_ENCODER_REPEAT_US = 900_000L   // 0.9s → ≈1fps floor on a static screen
+        /** [perf] Encoded-frame queue depth (was 8). */
+        private const val FRAME_QUEUE_CAPACITY = 3
+        /** [perf] Minimum gap between drop-triggered IDR requests. */
+        private const val DROP_IDR_MIN_GAP_MS = 750L
 
         /** Diagnostic build flag: dump the H.264 we send to the bike (bounded). Turn on to capture a
          *  .h264 of the exact wire stream for offline ffprobe analysis; off for normal use. */

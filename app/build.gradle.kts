@@ -1,4 +1,4 @@
-﻿plugins {
+plugins {
     alias(libs.plugins.android.application)
 }
 
@@ -17,10 +17,13 @@ android {
 
     defaultConfig {
         applicationId = "dev.zanderp.opencfmoto"
+        // [perf] Separate package so this build installs NEXT TO the official app (different
+        // signing key) — keep the original as a fallback. Run only one of the two at a time.
+        applicationIdSuffix = ".perf"
         minSdk = 29
         targetSdk = 36
         versionCode = 77
-        versionName = "2.0.18"
+        versionName = "2.0.18-perf"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -36,7 +39,8 @@ android {
         // Override: -PtelemetryUrl=https://….workers.dev  or TELEMETRY_URL env / gradle.properties
         val telemetryUrl = (project.findProperty("telemetryUrl") as String?)
             ?: System.getenv("TELEMETRY_URL")
-            ?: "https://opencfmoto-telemetry.hello-3d9.workers.dev"
+            // [perf] Off by default in this fork so modified builds don't skew upstream stats.
+            ?: ""
         buildConfigField("String", "TELEMETRY_URL", "\"$telemetryUrl\"")
 
         // Short git hash for Share Logs triage (configuration-cache safe).
@@ -59,10 +63,20 @@ android {
 
     signingConfigs {
         create("debugRelease") {
-            storeFile = file("${System.getProperty("user.home")}/.android/debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+            // [perf] CI can pass a persistent key via env (see .github/workflows/build-apk.yml) so
+            // every build updates the previous install. Locally it falls back to the debug keystore.
+            val ksPath = System.getenv("SIGNING_KEYSTORE_PATH")
+            if (!ksPath.isNullOrBlank()) {
+                storeFile = file(ksPath)
+                storePassword = System.getenv("SIGNING_STORE_PASSWORD")
+                keyAlias = System.getenv("SIGNING_KEY_ALIAS")
+                keyPassword = System.getenv("SIGNING_KEY_PASSWORD")
+            } else {
+                storeFile = file("${System.getProperty("user.home")}/.android/debug.keystore")
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
         }
     }
 

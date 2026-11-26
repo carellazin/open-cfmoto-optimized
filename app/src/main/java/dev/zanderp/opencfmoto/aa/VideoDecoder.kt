@@ -216,17 +216,34 @@ class VideoDecoder {
             codec = MediaCodec.createByCodecName(bestCodec)
             codecBufferInfo = MediaCodec.BufferInfo()
 
-            val format = MediaFormat.createVideoFormat(mimeType, width, height)
-            if (sps != null) format.setByteBuffer("csd-0", ByteBuffer.wrap(sps!!))
-            if (pps != null) format.setByteBuffer("csd-1", ByteBuffer.wrap(pps!!))
-            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 2 * 1024 * 1024)
+            fun baseFormat() = MediaFormat.createVideoFormat(mimeType, width, height).apply {
+                if (sps != null) setByteBuffer("csd-0", ByteBuffer.wrap(sps!!))
+                if (pps != null) setByteBuffer("csd-1", ByteBuffer.wrap(pps!!))
+                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 2 * 1024 * 1024)
+            }
 
             if (!mSurface!!.isValid) throw IllegalStateException("Surface not valid")
 
             AaLog.i("Configuring decoder: $bestCodec for ${width}x${height}")
-            codec?.configure(format, mSurface, null, 0)
-            try { codec?.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT) } catch (e: Exception) {}
-            codec?.start()
+            // [perf] Low-latency decode. Many hardware decoders hold several frames before output
+            // unless told otherwise — that is pure added lag before the re-encode to the dash. Try
+            // with the low-latency hints first; if the codec rejects them, fall back to the plain
+            // format exactly as before.
+            // configure() AND start() are both covered: some codecs accept the keys at configure time
+            // and only refuse real-time priority when resources are claimed in start().
+            val lowLatency = baseFormat().also { applyLowLatencyHints(it, bestCodec, mimeType) }
+            try {
+                codec?.configure(lowLatency, mSurface, null, 0)
+                try { codec?.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT) } catch (_: Exception) {}
+                codec?.start()
+                AaLog.i("Decoder started with low-latency hints")
+            } catch (e: Exception) {
+                AaLog.e("Low-latency decoder setup rejected — falling back to default format", e)
+                try { codec?.reset() } catch (_: Exception) {}
+                codec?.configure(baseFormat(), mSurface, null, 0)
+                try { codec?.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT) } catch (_: Exception) {}
+                codec?.start()
+            }
 
             running = true
             outputThread = Thread {
@@ -370,6 +387,37 @@ class VideoDecoder {
             }
         }
         AaLog.i("Output thread stopped")
+    }
+
+    /**
+     * [perf] Ask the decoder to output each frame as soon as it is decoded. Standard key on API 30+
+     * when the codec advertises FEATURE_LowLatency; vendor keys for Qualcomm / Exynos / Amlogic
+     * (the same ones game-streaming clients use). Unknown keys are ignored by other codecs.
+     * Real-time priority keeps the codec from being throttled behind other media work.
+     */
+    private fun applyLowLatencyHints(format: MediaFormat, codecName: String, mimeType: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val supported = try {
+                MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
+                    .firstOrNull { it.name == codecName }
+                    ?.getCapabilitiesForType(mimeType)
+                    ?.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency) == true
+            } catch (_: Exception) { false }
+            if (supported) {
+                format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                AaLog.i("Decoder $codecName supports FEATURE_LowLatency — enabled")
+            }
+        }
+        format.setInteger(MediaFormat.KEY_PRIORITY, 0) // 0 = real-time
+        val n = codecName.lowercase(Locale.ROOT)
+        when {
+            n.startsWith("omx.qcom") || n.startsWith("c2.qti") ->
+                format.setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
+            n.startsWith("omx.exynos") || n.startsWith("c2.exynos") ->
+                format.setInteger("vendor.rtc-ext-dec-low-latency.enable", 1)
+            n.startsWith("omx.amlogic") || n.startsWith("c2.amlogic") ->
+                format.setInteger("vendor.low-latency.enable", 1)
+        }
     }
 
     private fun findBestCodec(mimeType: String, preferHardware: Boolean): String? {

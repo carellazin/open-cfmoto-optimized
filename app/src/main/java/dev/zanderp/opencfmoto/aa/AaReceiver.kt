@@ -36,11 +36,24 @@ class AaReceiver(
          */
         const val HEADUNIT_SERVER_PORT = 5277
 
-        /** Let the three AaSelfMode pokes (~3.6 s of escalation) play out before dialling out. */
-        private const val FIRST_DIAL_DELAY_MS = 4_000L
-        private const val DIAL_INTERVAL_MS = 2_000L
-        private const val DIAL_ATTEMPTS = 20
+        /**
+         * [perf] Dial the head unit server almost immediately. On AA 17.4+ the AaSelfMode pokes are
+         * swallowed silently, so the old fixed 4 s wait was pure dead time on every connect. A
+         * loopback connect to a closed port is refused instantly, and [claimSession] already makes
+         * the inbound :5288 path and this dial-out mutually exclusive, so racing them is safe; once
+         * a session is live, AaSelfMode skips its pokes (AaVideoBridge.aaSessionLive).
+         */
+        private const val FIRST_DIAL_DELAY_MS = 300L
+        private const val DIAL_INTERVAL_MS = 500L
+        private const val DIAL_ATTEMPTS = 80          // same ~40 s window as before (20 × 2 s)
         private const val DIAL_TIMEOUT_MS = 800
+        /**
+         * [perf] Decode fps that counts as "AA video is up" for the bike hand-off. Was 25: phones that
+         * render AA at ~20–24 fps (or ramp up slowly) held the bike probe back for extra seconds even
+         * though frames were flowing. The compositor keep-alive covers any gap, so 15 fps sustained
+         * for a full 1 s window is plenty of proof that the session is real.
+         */
+        private const val STEADY_FPS = 15
     }
 
     @Volatile private var running = false
@@ -72,7 +85,7 @@ class AaReceiver(
         onFpsChanged = { fps ->
             log("[AA] decode fps=$fps")
             AaVideoBridge.aaDecoding = true
-            if (!steadyVideoFired && fps >= 25) {
+            if (!steadyVideoFired && fps >= STEADY_FPS) {
                 steadyVideoFired = true
                 log("[AA] steady video reached (fps=$fps) — signalling ready for bike hand-off")
                 try { AaVideoBridge.onSteadyVideo?.invoke() } catch (_: Exception) {}
@@ -290,7 +303,7 @@ class AaReceiver(
             val sock = try {
                 connectLoopback(HEADUNIT_SERVER_PORT)
             } catch (e: Exception) {
-                if (attempt == 1 || attempt % 5 == 0) {
+                if (attempt == 1 || attempt % 20 == 0) {
                     log(
                         "[AA] head unit server :$HEADUNIT_SERVER_PORT no answer " +
                             "(try $attempt/$DIAL_ATTEMPTS) — ${e.javaClass.simpleName}: ${e.message}",
