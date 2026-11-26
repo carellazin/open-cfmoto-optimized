@@ -5,6 +5,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write   # publish the APK as a GitHub Release (direct phone download)
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -73,3 +76,15 @@ jobs:
           name: OpenCfMoto-perf-apk
           path: out/*.apk
           if-no-files-found: error
+
+      # Direct download link for the phone: github.com/<you>/<repo>/releases/latest
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="perf-${{ github.run_number }}"
+          SHA="$(git rev-parse --short HEAD)"
+          gh release create "$TAG" out/OpenCfMoto-perf-arm64.apk \
+            --repo "${{ github.repository }}" --target "${{ github.sha }}" --latest \
+            --title "OpenCfMoto Perf build ${{ github.run_number }} ($SHA)" \
+            --notes "Build automatica da $SHA. Installa OpenCfMoto-perf-arm64.apk (Android 10+, ARM 64-bit). Modifiche: vedi PERF-CHANGES.md."
